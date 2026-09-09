@@ -56,6 +56,24 @@ def crop(image, target, region):
         target["boxes_o"] = cropped_boxes.reshape(-1, 4)
         fields.append("boxes_o")
 
+    # 2026-09-08 (ov_hoi, code/ov_hoi/notes/DET_INJECTION_DESIGN.md): cached
+    # external detections ride along in the target as det_boxes / det_scores /
+    # det_labels / det_embeds so they undergo exactly the same geometry as the
+    # image. They are filtered per box (not per GT pair) and never join
+    # `fields`, so the GT handling above is untouched. No-op when absent.
+    if "det_boxes" in target:
+        max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        det = target["det_boxes"] - torch.as_tensor([j, i, j, i])
+        det = torch.min(det.reshape(-1, 2, 2), max_size).clamp(min=0)
+        # keep_det = torch.all(det[:, 1, :] > det[:, 0, :], dim=1)   # original: any positive area
+        # 2026-09-09: require >= 1 px in both dims; sub-pixel boxes blow up the
+        # pairwise spatial encodings (NaN loss, see utils.DataFactory).
+        keep_det = torch.all(det[:, 1, :] - det[:, 0, :] >= 1.0, dim=1)
+        target["det_boxes"] = det.reshape(-1, 4)[keep_det]
+        for k in ("det_scores", "det_labels", "det_embeds"):
+            if k in target:
+                target[k] = target[k][keep_det]
+
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
         target['masks'] = target['masks'][:, i:i + h, j:j + w]
@@ -104,6 +122,12 @@ def hflip(image, target):
         boxes = target["boxes_o"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["boxes_o"] = boxes
+
+    # 2026-09-08 (ov_hoi, DET_INJECTION_DESIGN.md): flip cached detections too.
+    if "det_boxes" in target:
+        boxes = target["det_boxes"]
+        boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        target["det_boxes"] = boxes
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
@@ -164,6 +188,11 @@ def resize(image, target, size, max_size=None):
         boxes = target["boxes_o"]
         scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["boxes_o"] = scaled_boxes
+
+    # 2026-09-08 (ov_hoi, DET_INJECTION_DESIGN.md): scale cached detections too.
+    if "det_boxes" in target:
+        boxes = target["det_boxes"]
+        target["det_boxes"] = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
 
     if "area" in target:
         area = target["area"]
