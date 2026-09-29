@@ -6,6 +6,7 @@ import random
 
 import PIL
 import torch
+import torch.nn.functional as _Fnn  # 2026-09-10 GDINO_MEMORY_DESIGN.md (crop_grid)
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 
@@ -13,7 +14,27 @@ from ..util.box_ops import box_xyxy_to_cxcywh
 from ..util.misc import interpolate
 
 
+def crop_grid(grid, full_hw, region):
+    """2026-09-10 (ov_hoi, code/ov_hoi/notes/GDINO_MEMORY_DESIGN.md). Resample a cached
+    feature grid (C, Hg, Wg) that covers the whole image of size full_hw=(H, W) onto the
+    crop window region=(i, j, h, w), keeping roughly the same cell density. Bilinear
+    grid_sample at the centres of the output cells (align_corners=False convention), so
+    a linear field is reproduced exactly; border padding for the half-cell overhang."""
+    H, W = full_hw
+    i, j, h, w = region
+    C, Hg, Wg = grid.shape
+    oh = max(1, int(round(Hg * h / H)))
+    ow = max(1, int(round(Wg * w / W)))
+    ys = (i + (torch.arange(oh, dtype=torch.float32) + 0.5) * h / oh) / H * 2 - 1
+    xs = (j + (torch.arange(ow, dtype=torch.float32) + 0.5) * w / ow) / W * 2 - 1
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    g = torch.stack([gx, gy], dim=-1).unsqueeze(0)                       # (1, oh, ow, 2)
+    return _Fnn.grid_sample(grid.unsqueeze(0).float(), g, mode="bilinear",
+                            padding_mode="border", align_corners=False)[0].to(grid.dtype)
+
+
 def crop(image, target, region):
+    _full_w, _full_h = image.size   # 2026-09-10 GDINO_MEMORY_DESIGN.md: pre-crop size for crop_grid
     cropped_image = F.crop(image, *region)
 
     target = target.copy()
@@ -70,9 +91,16 @@ def crop(image, target, region):
         # pairwise spatial encodings (NaN loss, see utils.DataFactory).
         keep_det = torch.all(det[:, 1, :] - det[:, 0, :] >= 1.0, dim=1)
         target["det_boxes"] = det.reshape(-1, 4)[keep_det]
-        for k in ("det_scores", "det_labels", "det_embeds"):
+        # for k in ("det_scores", "det_labels", "det_embeds"):                      # original
+        for k in ("det_scores", "det_labels", "det_embeds", "det_noun_ids", "det_noun_probs"):   # 2026-09-26 SOFT_NOUN fields ride along
             if k in target:
                 target[k] = target[k][keep_det]
+
+    # 2026-09-10 (ov_hoi, GDINO_MEMORY_DESIGN.md): a cached feature grid over the whole
+    # pre-crop image rides along as det_memory (C, Hg, Wg); resample it to the crop window
+    # so it keeps covering exactly the image the model sees. No-op when absent.
+    if "det_memory" in target:
+        target["det_memory"] = crop_grid(target["det_memory"], (_full_h, _full_w), region)
 
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
@@ -128,6 +156,10 @@ def hflip(image, target):
         boxes = target["det_boxes"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["det_boxes"] = boxes
+    # 2026-09-10 (GDINO_MEMORY_DESIGN.md): mirror the cached feature grid too. resize() needs
+    # no branch: the grid is in relative coordinates and is resampled to the C5 size in umi.py.
+    if "det_memory" in target:
+        target["det_memory"] = target["det_memory"].flip(-1)
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
