@@ -2,6 +2,7 @@
 """
 Transforms and data augmentation for both image + bbox.
 """
+import os
 import random
 
 import PIL
@@ -119,10 +120,24 @@ def crop(image, target, region):
         else:
             cropped_bh = target['boxes_h'].reshape(-1, 2, 2)
             cropped_bo = target['boxes_o'].reshape(-1, 2, 2)
-            keep = torch.logical_and(
-                torch.all(cropped_bh[:, 1, :] > cropped_bo[:, 0, :], dim=1),
-                torch.all(cropped_bo[:, 1, :] > cropped_bo[:, 0, :], dim=1)
-            )
+            # keep = torch.logical_and(                                                      # original (inherited):
+            #     torch.all(cropped_bh[:, 1, :] > cropped_bo[:, 0, :], dim=1),               # compares the HUMAN bottom-right with the
+            #     torch.all(cropped_bo[:, 1, :] > cropped_bo[:, 0, :], dim=1)                # OBJECT top-left -> drops valid pairs whose
+            # )                                                                              # human lies up-left of the object, keeps
+            #                                                                                # degenerate human boxes (Codex audit 2026-10-11:
+            #                                                                                # 4.1% of crop-branch rows mis-dropped on UV)
+            # 2026-10-11 (ov_hoi): CROP_VALID_FIX=1 checks each box's OWN positive area. Default keeps the original behaviour so
+            # that results obtained before this date stay comparable; new configs set the flag.
+            if os.environ.get("CROP_VALID_FIX") == "1":
+                keep = torch.logical_and(
+                    torch.all(cropped_bh[:, 1, :] > cropped_bh[:, 0, :], dim=1),
+                    torch.all(cropped_bo[:, 1, :] > cropped_bo[:, 0, :], dim=1)
+                )
+            else:
+                keep = torch.logical_and(
+                    torch.all(cropped_bh[:, 1, :] > cropped_bo[:, 0, :], dim=1),
+                    torch.all(cropped_bo[:, 1, :] > cropped_bo[:, 0, :], dim=1)
+                )
 
         for field in fields:
             target[field] = target[field][keep]
